@@ -52,7 +52,16 @@ class STLHelper:
                 if label == -1: continue
                 cluster_pts = pts[clustering.labels_ == label]
                 center = np.mean(cluster_pts, axis=0)
-                centers.append({"center": list(center)})
+                
+                # Approximate area for naked edges
+                mins = np.min(cluster_pts, axis=0)
+                maxs = np.max(cluster_pts, axis=0)
+                dims = sorted(maxs - mins)
+                area = dims[1] * dims[2]
+                if area < 0.01: area = 0.25 # Fallback 0.25 m2 if calculation is too small
+                
+                # FIXED: Pack area_m2 into dictionary
+                centers.append({"center": list(center), "area_m2": area})
             return centers
         except ImportError:
             return []
@@ -108,7 +117,8 @@ class STLHelper:
 
                 loop_stats.sort(key=lambda x: x['area'], reverse=True)
                 for vent in loop_stats[1:]:
-                    vents.append({"center": vent['center']})
+                    # FIXED: Pack area_m2 into dictionary
+                    vents.append({"center": vent['center'], "area_m2": vent['area']})
         return vents
 
     def _order_edges_into_loops(self, edges):

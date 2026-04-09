@@ -16,6 +16,8 @@ import time
 import shutil
 import json
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import numpy as np
 import uuid
 import re
@@ -45,6 +47,7 @@ except Exception as e:
 from case_builder import CaseBuilder
 from runner import SimulationRunner
 from stl_helper import STLHelper
+import setup_template_v13_multicomponent
 
 # --- CONFIGURATION ---
 TEMPLATE_PATH = os.path.join("templates", "base_case_multicomp")
@@ -79,14 +82,18 @@ HAZARD_LIMITS = {
     "CH3OH": {"type": "toxic", "visible": 50, "low": 200, "high": 400, "emergency": 3000},
 }
 
-# --- FIXED COLOR MAP ---
+# --- EXTENDED COLOR MAP ---
 RESIDUAL_COLOR_MAP = {
     "p_rgh": "#1f77b4", "p": "#1f77b4",
     "Ux": "#d62728", "Uy": "#ff7f0e", "Uz": "#9467bd",
     "k": "#2ca02c", "epsilon": "#8c564b", "omega": "#8c564b",
     "h": "#e377c2", "T": "#e377c2",
-    "Air": "#7f7f7f", "CH4": "#bcbd22", "C3H8": "#17becf",
-    "H2": "#ff9896", "NH3": "#98df8a", "CO2": "#c5b0d5"
+    "Air": "#000000", "CH4": "#bcbd22", "C3H8": "#17becf",
+    "H2": "#ff9896", "NH3": "#98df8a", "CO2": "#c5b0d5",
+    "C2H6": "#a6cee3", "C4H10": "#b2df8a", "C2H4": "#fb9a99", "C2H2": "#fdbf6f",
+    "C5H12": "#cab2d6", "C6H14": "#ffff99", "H2S": "#b15928", "CO": "#8dd3c7",
+    "Cl2": "#bebada", "SO2": "#fb8072", "NO2": "#80b1d3", "NO": "#fccde5",
+    "HCN": "#d9d9d9", "C6H6": "#bc80bd", "C7H8": "#ccebc5", "CH3OH": "#ffed6f"
 }
 
 for d in [SIM_ROOT, ARCHIVE_DIR]:
@@ -131,6 +138,11 @@ if os.path.exists(DEFAULTS_FILE):
 for key, default_val in DEFAULT_SETTINGS.items():
     if key not in st.session_state:
         st.session_state[key] = user_defaults.get(key, default_val)
+
+if "wind_speed" not in st.session_state: st.session_state.wind_speed = 5.0
+if "wind_dir" not in st.session_state: st.session_state.wind_dir = 90.0
+if "stability_class" not in st.session_state: st.session_state.stability_class = "D (Neutral)"
+if "z0" not in st.session_state: st.session_state.z0 = 0.1
 
 # --- HELPER FUNCS ---
 def load_and_clean_csv(file_or_path):
@@ -185,33 +197,41 @@ def check_logs_for_errors(case_path):
         full_path = os.path.join(case_path, log_file)
         if os.path.exists(full_path):
             with open(full_path, "r") as f:
-                content = f.read()
-                if "FOAM FATAL" in content or "FOAM FATAL IO ERROR" in content or "command not found" in content or "No such file or directory" in content:
-                    return log_file, content[-1500:]
+                lines = f.readlines()
+                tail_content = "".join(lines[-2000:])
+                if "FOAM FATAL" in tail_content or "FOAM FATAL IO ERROR" in tail_content or "command not found" in tail_content or "No such file or directory" in tail_content:
+                    return log_file, tail_content[-1500:]
     return None, None
 
-def check_steady_state(df_out_timeseries, window_size=20, threshold=0.05):
+def check_steady_state(df_out_timeseries, inventory_remaining, is_blowdown, window_size=20, threshold=0.05):
     if df_out_timeseries is None or len(df_out_timeseries) < window_size:
         return False
         
     latest_time = df_out_timeseries['Time'].max()
-    if latest_time < 20.0:
-        return False
-        
+    
     latest_data = df_out_timeseries[df_out_timeseries['Time'] == latest_time]
-    primary_spec = latest_data.loc[latest_data['Concentration (ppm)'].idxmax()]['Species']
+    eval_data = latest_data[~latest_data['Species'].isin(['Air'])]
+    if eval_data.empty: return False
+    
+    primary_spec = eval_data.loc[eval_data['Concentration (ppm)'].idxmax()]['Species']
+    limit_data = HAZARD_LIMITS.get(primary_spec, {"low": 5000})
+    
+    spec_max = df_out_timeseries[df_out_timeseries['Species'] == primary_spec]['Concentration (ppm)'].max()
+    if spec_max < limit_data["low"] or latest_time < 20.0: return False
     
     spec_data = df_out_timeseries[df_out_timeseries['Species'] == primary_spec]['Concentration (ppm)'].values[-window_size:]
     
     if len(spec_data) == window_size:
-        val_max = np.max(spec_data)
-        val_min = np.min(spec_data)
         val_mean = np.mean(spec_data)
         
-        if val_mean > 10.0:
-            deviation = (val_max - val_min) / val_mean
-            if deviation <= threshold:
+        if is_blowdown:
+            if inventory_remaining < 0.01 and val_mean < 10.0: 
                 return True
+        else:
+            if val_mean > limit_data["low"]:
+                deviation = (np.max(spec_data) - np.min(spec_data)) / val_mean
+                if deviation <= threshold:
+                    return True
                 
     return False
 
@@ -232,18 +252,19 @@ pid = None
 active_run = load_state()
 is_resuming = False
 
-if active_run and runner.is_process_running(active_run.get("pid")):
-    is_resuming = True
-    pid = active_run.get("pid")
-    st.session_state.sim_status = active_run["status_data"]
+if active_run and active_run.get("is_running", False):
     st.session_state.is_running = True
+    st.session_state.sim_status = active_run.get("status_data", [])
+    st.session_state.current_idx = active_run.get("current_idx", 0)
+    pid = active_run.get("pid")
+    
     if "vent_config" in active_run:
         vc = active_run["vent_config"]
-        if st.session_state.inlet_center is None: st.session_state.inlet_center = vc["inlet"]
-        if st.session_state.outlet_center is None: st.session_state.outlet_center = vc["outlet"]
-        if st.session_state.inlet_area_sqft == 1.0: st.session_state.inlet_area_sqft = vc["area"]
+        if st.session_state.inlet_center is None: st.session_state.inlet_center = vc.get("inlet")
+        if st.session_state.outlet_center is None: st.session_state.outlet_center = vc.get("outlet")
+        if st.session_state.inlet_area_sqft == 1.0: st.session_state.inlet_area_sqft = vc.get("area", 1.0)
 
-tab1, tab2, tab3 = st.tabs(["🚀 Setup & Run", "📈 Live Monitor", "🔍 Analysis & Download"])
+tab1, tab2, tab3 = st.tabs(["🚀 Setup & Run", "📈 Live Monitor", "🔍 3D Analysis & Download"])
 
 # ================= TAB 3: ANALYSIS =================
 with tab3:
@@ -255,7 +276,6 @@ with tab3:
             st.rerun()
 
     if os.path.exists(SIM_ROOT):
-        # Order scenarios strictly by the CSV original sequence
         cases_in_dir = [d for d in os.listdir(SIM_ROOT) if d.startswith("case_")]
         cases = []
         df_backup = load_and_clean_csv(SCENARIO_BACKUP)
@@ -301,7 +321,7 @@ with tab3:
                         st.error("ParaView executable not found. Ensure it is installed and in your system PATH.")
 
             st.divider()
-            st.markdown("#### 🧊 In-App 3D Viewer (Latest Time Step)")
+            st.markdown("#### 🧊 In-App 3D Viewer (Animated Timeline)")
             
             if PYVISTA_AVAILABLE:
                 vtk_dir = os.path.join(case_path, "postProcessing", "surfaces1")
@@ -311,39 +331,87 @@ with tab3:
                 if os.path.exists(vtk_dir):
                     times = sorted([d for d in os.listdir(vtk_dir) if d.replace('.','').isdigit()], key=float)
                     if times:
-                        latest_time = times[-1]
                         
                         col_vis1, col_vis2, col_vis3 = st.columns(3)
                         with col_vis1:
                             show_room = st.checkbox("Show Room/Obstacles", value=True)
-                            show_coord_grid = st.checkbox("Show Bounding Coordinate Outline (ft)", value=True)
-                            show_markers = st.checkbox("Show HVAC & Leak Markers", value=True)
-                            show_vis_cloud = st.checkbox("Show Visible Plume (Base Cloud)", value=True)
+                            show_coord_grid = st.checkbox("Show Origin Planes (X=0, Y=0, Z=0) & Coordinate Outline (ft)", value=True)
+                            show_markers = st.checkbox("Show Component Markers", value=True)
+                            show_vis_cloud = st.checkbox("Show Visible Plume", value=True)
                         with col_vis2:
-                            show_low_cloud = st.checkbox("Show Low Alarm Cloud (Warning)", value=True)
-                            show_high_cloud = st.checkbox("Show High Alarm Cloud (Danger)", value=False)
+                            show_low_cloud = st.checkbox("Show Low Alarm Cloud", value=True)
+                            show_high_cloud = st.checkbox("Show High Alarm Cloud", value=False)
                             show_emerg_cloud = st.checkbox("Show Emergency Cloud", value=False)
                         with col_vis3:
-                            show_leak_lines = st.checkbox("Show Leak Flow Streamlines", value=True)
-                            show_hvac_lines = st.checkbox("Show HVAC Streamlines", value=False)
+                            show_leak_lines = st.checkbox("Show Leak Streamlines", value=True)
+                            show_hvac_lines = st.checkbox("Show HVAC Flowlines", value=False)
                             cloud_opacity = st.slider("Cloud Opacity", 0.1, 1.0, 0.5)
+
+                        selected_time_float = st.select_slider("Scrub Timeline (Seconds):", options=[float(t) for t in times], value=float(times[-1]))
+                        latest_time = next(t for t in times if float(t) == selected_time_float)
 
                         if st.button(f"Render 3D Model for {sel_case}"):
                             with st.spinner("Rendering 3D Model..."):
                                 try:
                                     plotter = pv.Plotter(window_size=[900, 700])
-                                    plotter.add_axes() # Core XYZ axes
+                                    scale_ft = 3.28084 
                                     
-                                    scale_ft = 3.28084  # Convert OpenFOAM meters to feet for UI render
-                                    
+                                    all_meshes_for_bounds = []
+                                    stl_file_path = os.path.join(case_path, "constant", "triSurface", "room.stl")
+                                    if show_room and os.path.exists(stl_file_path):
+                                        room = pv.read(stl_file_path)
+                                        room.points *= scale_ft
+                                        all_meshes_for_bounds.append(room)
+                                        
+                                    cfg_path = os.path.join(case_path, "case_config.json")
+                                    if stl_file_path and show_room and os.path.exists(cfg_path):
+                                        with open(cfg_path, 'r') as f:
+                                            c_cfg = json.load(f)
+                                        inl = c_cfg.get("inlet")
+                                        outl = c_cfg.get("outlet")
+                                        leak_orig = c_cfg.get("leak")
+                                        
+                                        if inl and show_markers:
+                                            plotter.add_point_labels([np.array(inl)*scale_ft], ["HVAC Inlet\nEntry Point"], point_color='blue', text_color='blue', shape_color='white', shape_opacity=0.8, point_size=30, bold=True)
+                                        if outl and show_markers:
+                                            plotter.add_point_labels([np.array(outl)*scale_ft], ["HVAC Outlet\nExit Point"], point_color='green', text_color='green', shape_color='white', shape_opacity=0.8, point_size=30, bold=True)
+                                        if leak_orig and show_markers:
+                                            plotter.add_point_labels([np.array(leak_orig)*scale_ft], ["Leak Origin"], point_color='yellow', text_color='yellow', shape_color='black', shape_opacity=0.8, point_size=30, bold=True)
+
+                                    if show_vis_cloud:
+                                        if not show_room:
+                                            show_room = True 
+                                            
+                                    if all_meshes_for_bounds:
+                                        combined_context = all_meshes_for_bounds[0]
+                                        for m in all_meshes_for_bounds[1:]: combined_context += m
+                                        bounds = combined_context.bounds
+                                        bounds_min = [bounds[0], bounds[2], bounds[4]]
+                                        bounds_max = [bounds[1], bounds[3], bounds[5]]
+                                        plotter.add_mesh(combined_context, style='wireframe', color='black', opacity=0.3, label='Room Geometry context')
+                                    else:
+                                        bounds_min, bounds_max = [-10,-10,-10], [10,10,10]
+                                        
                                     if show_coord_grid:
-                                        try:
-                                            plotter.show_bounds(grid=False, location='outer', ticks='outside',
-                                                                xtitle='X (ft)', ytitle='Y (ft)', ztitle='Z (ft)', color="black")
-                                        except TypeError:
-                                            plotter.show_bounds(grid=False, location='outer', ticks='outside',
-                                                                xlabel='X (ft)', ylabel='Y (ft)', zlabel='Z (ft)', color="black")
-                                    
+                                        p_center = [(bounds_max[i]+bounds_min[i])/2.0 for i in range(3)]
+                                        p_size = [max(bounds_max[i]-bounds_min[i], 20.0)*1.2 for i in range(3)] 
+                                        
+                                        plane_yz = pv.Plane(center=(0.0, p_center[1], p_center[2]), direction=(1, 0, 0), i_size=p_size[1], j_size=p_size[2])
+                                        plane_xz = pv.Plane(center=(p_center[0], 0.0, p_center[2]), direction=(0, 1, 0), i_size=p_size[0], j_size=p_size[2])
+                                        plane_xy = pv.Plane(center=(p_center[0], p_center[1], 0.0), direction=(0, 0, 1), i_size=p_size[0], j_size=p_size[1])
+                                        
+                                        plotter.add_mesh(plane_yz, color='red', opacity=0.2, show_edges=True, edge_color='darkred', label='X=0 (YZ Plane)')
+                                        plotter.add_mesh(plane_xz, color='green', opacity=0.2, show_edges=True, edge_color='darkgreen', label='Y=0 (XZ Plane)')
+                                        plotter.add_mesh(plane_xy, color='blue', opacity=0.2, show_edges=True, edge_color='darkblue', label='Z=0 (XY Plane)')
+
+                                        with warnings.catch_warnings():
+                                            warnings.simplefilter("ignore")
+                                            try:
+                                                plotter.show_bounds(grid=False, location='outer', ticks='outside', xtitle='X (ft)', ytitle='Y (ft)', ztitle='Z (ft)', color="black")
+                                            except TypeError:
+                                                plotter.show_bounds(grid=False, location='outer', ticks='outside', xlabel='X (ft)', ylabel='Y (ft)', zlabel='Z (ft)', color="black")
+                                            plotter.add_axes() 
+                                        
                                     df_backup = load_and_clean_csv(SCENARIO_BACKUP)
                                     primary_gas = "CH4" 
                                     scen_data = pd.DataFrame()
@@ -354,26 +422,6 @@ with tab3:
                                             comp_raw = str(scen_data.iloc[0].get('COMPOSITION', "CH4:1.0")).split(';')[0]
                                             primary_gas = comp_raw.split(':')[0].strip().upper()
                                             primary_gas = builder.NAME_MAP.get(primary_gas, primary_gas)
-
-                                    if show_markers:
-                                        # Leak Marker
-                                        if not scen_data.empty:
-                                            x_c = float(scen_data.iloc[0].get('X', 0)) * scale_ft
-                                            y_c = float(scen_data.iloc[0].get('Y', 0)) * scale_ft
-                                            z_c = float(scen_data.iloc[0].get('Z', 0)) * scale_ft
-                                            plotter.add_point_labels([[x_c, y_c, z_c]], ["Leak Source"], point_color='yellow', text_color='yellow', shape_color='black', shape_opacity=0.7, point_size=15)
-                                        
-                                        # HVAC Markers
-                                        cfg_path = os.path.join(case_path, "case_config.json")
-                                        if os.path.exists(cfg_path):
-                                            with open(cfg_path, 'r') as f:
-                                                c_cfg = json.load(f)
-                                            inl = c_cfg.get("inlet")
-                                            outl = c_cfg.get("outlet")
-                                            if inl:
-                                                plotter.add_point_labels([np.array(inl)*scale_ft], ["HVAC Inlet"], point_color='blue', text_color='blue', shape_color='white', shape_opacity=0.8, point_size=12)
-                                            if outl:
-                                                plotter.add_point_labels([np.array(outl)*scale_ft], ["HVAC Outlet"], point_color='green', text_color='green', shape_color='white', shape_opacity=0.8, point_size=12)
                                     
                                     limits = HAZARD_LIMITS.get(primary_gas, {"visible": 100, "low": 5000, "high": 25000, "emergency": 50000})
                                     limit_type = "LEL" if limits.get("type", "flammable") == "flammable" else "PEL"
@@ -387,7 +435,8 @@ with tab3:
                                                 mesh = pv.read(vtks[0])
                                                 if mesh.n_points > 0:
                                                     mesh.points *= scale_ft
-                                                    plotter.add_mesh(mesh, color=color, opacity=cloud_opacity, label=label_text)
+                                                    mesh = mesh.compute_normals()
+                                                    plotter.add_mesh(mesh, color=color, opacity=cloud_opacity, smooth_shading=True, label=label_text)
 
                                     if show_vis_cloud:
                                         render_cloud("Visible", 'lightblue', f"{primary_gas} Visible Plume (> {limits['visible']} ppm)")
@@ -398,39 +447,45 @@ with tab3:
                                     if show_emerg_cloud:
                                         render_cloud("Emergency", 'darkred', f"{primary_gas} Emergency Alarm (> {limits['emergency']} ppm)")
                                     
-                                    def render_streamlines(s_dir, label_text, cmap):
+                                    def render_streamlines(s_dir, label_text, cmap, solid_color=None, tube_radius=0.015, glyph_factor=0.3):
                                         s_path = os.path.join(s_dir, latest_time)
                                         if os.path.exists(s_path):
                                             s_vtks = glob.glob(os.path.join(s_path, "*.vtk"))
                                             if s_vtks:
-                                                s_mesh = pv.read(s_vtks[0])
-                                                blocks = [s_mesh] if not isinstance(s_mesh, pv.MultiBlock) else s_mesh
-                                                for block in blocks:
-                                                    if block is not None and block.n_points > 0:
-                                                        block.points *= scale_ft
-                                                        if "U" in block.array_names:
-                                                            block["U"] *= scale_ft # Scale velocity to ft/s
-                                                            block.set_active_vectors("U")
-                                                            plotter.add_mesh(block.tube(radius=0.05 * scale_ft), scalars="U", cmap=cmap, label=label_text, scalar_bar_args={'title': 'Velocity U (ft/s)'})
-                                                            
-                                                            # Add directional arrows
-                                                            arrows = block.glyph(orient="U", scale=False, factor=0.3 * scale_ft)
-                                                            plotter.add_mesh(arrows, color="white")
+                                                full_mesh = pv.read(s_vtks[0])
+                                                combined = full_mesh
+                                                if isinstance(full_mesh, pv.MultiBlock):
+                                                    combined = full_mesh.combine()
+
+                                                if combined is not None and combined.n_points > 0 and combined.n_cells > 0:
+                                                    combined.points *= scale_ft
+                                                    try:
+                                                        tube = combined.tube(radius=tube_radius * scale_ft) 
+                                                        if tube.n_points > 0 and "U" in tube.array_names:
+                                                            tube["U"] *= scale_ft
+                                                            if solid_color:
+                                                                plotter.add_mesh(tube, color=solid_color, opacity=0.8, label=label_text)
+                                                                try:
+                                                                    arrows = combined.glyph(orient="U", scale=False, factor=glyph_factor * scale_ft, tolerance=0.05, geom=pv.Arrow())
+                                                                    plotter.add_mesh(arrows, color=solid_color)
+                                                                except: pass
+                                                            else:
+                                                                plotter.add_mesh(tube, scalars="U", cmap=cmap, opacity=0.8, label=label_text, scalar_bar_args={'title': 'Velocity U (ft/s)'})
+                                                                try:
+                                                                    arrows = combined.glyph(orient="U", scale=False, factor=glyph_factor * scale_ft, tolerance=0.05, geom=pv.Arrow())
+                                                                    plotter.add_mesh(arrows, color="black")
+                                                                except: pass
+                                                    except Exception as e:
+                                                        pass
 
                                     if show_leak_lines:
-                                        render_streamlines(streamlines_leak_dir, 'Leak Streamlines', "jet")
+                                        render_streamlines(streamlines_leak_dir, 'Leak Streamlines', "jet", tube_radius=0.015, glyph_factor=0.3)
 
                                     if show_hvac_lines:
-                                        render_streamlines(streamlines_hvac_dir, 'HVAC Flow Path', "viridis")
-
-                                    stl_file = os.path.join(case_path, "constant", "triSurface", "room.stl")
-                                    if show_room and os.path.exists(stl_file):
-                                        room = pv.read(stl_file)
-                                        room.points *= scale_ft
-                                        plotter.add_mesh(room, style='wireframe', color='black', opacity=0.3, label='Room Geometry')
+                                        render_streamlines(streamlines_hvac_dir, 'HVAC Flowlines', None, solid_color="cyan", tube_radius=0.005, glyph_factor=0.2)
                                     
                                     plotter.add_legend()
-                                    stpyvista(plotter, key=f"pv_{sel_case}_{uuid.uuid4().hex}")
+                                    stpyvista(plotter, key=f"pv_{sel_case}_{latest_time}_{uuid.uuid4().hex}")
                                 except Exception as render_err:
                                     st.error(f"Failed to render 3D view. Missing dependencies? Error: {render_err}")
                     else:
@@ -475,7 +530,8 @@ with tab1:
                     outlet_idx = vent_opts[sel_outlet]
                     st.session_state.inlet_center = st.session_state.vents[inlet_idx]['center']
                     st.session_state.outlet_center = st.session_state.vents[outlet_idx]['center']
-                    if st.session_state.inlet_area_sqft == 1.0: st.session_state.inlet_area_sqft = 2.69
+                    detected_area = st.session_state.vents[inlet_idx].get('area_m2', 0.25) * 10.7639
+                    if st.session_state.inlet_area_sqft == 1.0: st.session_state.inlet_area_sqft = detected_area
                 else:
                     st.warning("⚠️ No holes detected. Using default centers.")
                     st.session_state.inlet_center = [0,0,0]
@@ -517,7 +573,6 @@ with tab1:
                         hvac_area = detected_area
                     hvac_press = st.number_input("Outlet Pressure (in. WC)", step=0.001, format="%.4f", key="hvac_press")
             
-            # Safe init for wind to avoid missing variable errors in config later
             wind_speed = st.session_state.wind_speed
             wind_dir = st.session_state.wind_dir
             stability_class = st.session_state.stability_class
@@ -534,7 +589,6 @@ with tab1:
                     stability_class = st.selectbox("Pasquill-Gifford Stability", ["A (Very Unstable)", "B", "C", "D (Neutral)", "E", "F (Very Stable)"], key="stability_class")
                     z0 = st.number_input("Surface Roughness z0 (m)", step=0.05, key="z0")
             
-            # Safe init for HVAC
             hvac_cfm = st.session_state.hvac_cfm
             hvac_temp = st.session_state.hvac_temp
             hvac_press = st.session_state.hvac_press
@@ -557,7 +611,8 @@ with tab1:
         st.divider()
 
         st.subheader("4. Simulation Control")
-        auto_stop = st.checkbox("Enable Auto-Stop (Kills process if 5% steady-state deviation is reached)", key="auto_stop")
+        st.info("ℹ️ If a simulation status says 'Completed (Reached Max Time)', it means the scenario ran for the full 'Simulation Duration' specified below without the gas completely clearing out. Increase the duration if you want to watch the gas fully dissipate.")
+        auto_stop = st.checkbox("Enable Auto-Stop (Inventory Released + decaying concentrations)", key="auto_stop")
         col_sim1, col_sim2 = st.columns(2)
         with col_sim1:
             sim_duration = st.number_input("Simulation Duration (s)", step=50, key="sim_duration")
@@ -634,7 +689,7 @@ with tab2:
     m_col1, m_col2, m_col3 = st.columns(3)
     queue_metric = m_col1.empty()
     success_metric = m_col2.empty()
-    failed_metric = m_col3.empty()
+    failed_metric = m_col3.empty() 
 
     def update_status_table(data):
         if not data: return
@@ -642,8 +697,7 @@ with tab2:
         df_stat.index = df_stat.index + 1
         status_table.dataframe(df_stat, width="stretch")
         
-        # Update metrics dynamically
-        c_count = sum(1 for s in data if "✅ Success" in s["Status"] or "✅ Already Done" in s["Status"])
+        c_count = sum(1 for s in data if "✅" in s["Status"])
         f_count = sum(1 for s in data if "❌" in s["Status"])
         queue_metric.metric("Total Scenarios Queue", len(data))
         success_metric.metric("Successfully Completed", c_count)
@@ -663,7 +717,7 @@ with tab2:
         col_prog1, col_prog2, col_prog3 = st.columns([2, 1, 1])
         with col_prog1: progress_bar = st.empty()
         with col_prog2: timer_placeholder = st.empty()
-        with col_prog3: inv_placeholder = st.empty() # Live Inventory Tracking Placeholder
+        with col_prog3: inv_placeholder = st.empty() 
         
         status_table = st.empty()
         if st.session_state.sim_status:
@@ -675,7 +729,7 @@ with tab2:
 
         st.divider()
         st.markdown("#### 🧪 Outlet Monitor")
-        flow_unit = st.selectbox("Flow Rate Unit", ["Mass (kg/s)", "Molar (kmol/s)", "Volumetric (m3/s)"])
+        flow_unit = st.selectbox("Flow Rate Unit", ["Mass (kg/s)", "Molar (kmol/s)", "Volumetric (m3/s)"], key="flow_unit_select")
         outlet_table = st.empty()
         outlet_chart_placeholder = st.empty()
 
@@ -722,13 +776,14 @@ with tab2:
 
             # Dynamic Configuration Hash generation
             group_df = df[df["scenario"] == scen_id]
+            hvac_area_local = st.session_state.inlet_area_sqft
             case_run_config = {
                 "csv_data": group_df.to_dict('records'),
                 "sim_mode": st.session_state.sim_mode,
                 "hvac_cfm": st.session_state.hvac_cfm,
                 "hvac_temp": st.session_state.hvac_temp,
                 "hvac_press": st.session_state.hvac_press,
-                "hvac_area": hvac_area, # evaluated locally
+                "hvac_area": hvac_area_local, # evaluated locally
                 "wind_speed": st.session_state.wind_speed,
                 "wind_dir": st.session_state.wind_dir,
                 "stability_class": st.session_state.stability_class,
@@ -760,21 +815,29 @@ with tab2:
                 continue
 
             if pid is None or not runner.is_process_running(pid):
-                is_fresh_or_failed = status_data[current_idx]["Status"] in ["Ready", "❌ Aborted", "❌ Failed/Aborted"]
+                case_exists = os.path.exists(case_path)
                 
-                # We also initialize if the hash does not match (i.e., user changed settings)
-                if is_fresh_or_failed or not hash_matches:
+                # Initialize if case doesnt exist OR settings have changed (hash mismatch)
+                if not case_exists or not hash_matches:
+                        
                     status_data[current_idx]["Status"] = "🔄 Initializing..."
                     update_status_table(status_data)
                     stl_obj = open("temp.stl", "rb") if os.path.exists("temp.stl") else None
                     
                     builder.create_case_from_group(
                         case_name, stl_obj, group_df, st.session_state.mesh_res, st.session_state.refine_lvl, st.session_state.num_cores,
-                        sim_mode=st.session_state.sim_mode, hvac_cfm=st.session_state.hvac_cfm, hvac_temp_f=st.session_state.hvac_temp, hvac_press_inwc=st.session_state.hvac_press, hvac_area_sqft=hvac_area,
+                        sim_mode=st.session_state.sim_mode, hvac_cfm=st.session_state.hvac_cfm, hvac_temp_f=st.session_state.hvac_temp, hvac_press_inwc=st.session_state.hvac_press, hvac_area_sqft=hvac_area_local,
                         vent_inlet_center=st.session_state.inlet_center, vent_outlet_center=st.session_state.outlet_center,
                         wind_speed=st.session_state.wind_speed, wind_dir=st.session_state.wind_dir, stability_class=st.session_state.stability_class, z0=st.session_state.z0,
                         probe_locations=probe_locations, sim_duration=st.session_state.sim_duration, max_courant=st.session_state.max_courant, delta_t=st.session_state.starting_delta_t
                     )
+                    
+                    # Save hash immediately so future runs know this configuration was built
+                    with open(os.path.join(case_path, "scenario_hash.txt"), "w") as f:
+                        f.write(current_hash)
+                else:
+                    status_data[current_idx]["Status"] = "🔄 Resuming..."
+                    update_status_table(status_data)
 
                 runner._optimize_control_dict(case_path)
                 pid, _ = runner.run_case_detached(case_path, st.session_state.num_cores) 
@@ -818,21 +881,26 @@ with tab2:
                         lines = f.readlines()
                         if lines:
                             live_log_tail.code(f"--- Last Updated: {datetime.now().strftime('%H:%M:%S')} ---\n" + "".join(lines[-10:]))
-                        tail = "".join(lines[-1000:])
-                        if "End" in tail and "ExecutionTime" in tail:
-                            try: os.kill(pid, 15)
-                            except: pass
-                            break
+                            
+                            # ROBUST END DETECTION TO BREAK LOOP
+                            tail_content = "".join(lines[-50:])
+                            if "\nEnd\n" in tail_content:
+                                break
 
                 current_time = 0.0
+                rem_inv_kg = 0.0
+                is_blowdown = False
                 df_resid = runner.get_residuals(log_path)
                 if df_resid is not None and not df_resid.empty and len(df_resid['Time'].unique()) > 1:
+                        
                     df_resid.sort_values(by="Variable", inplace=True)
                     current_time = df_resid['Time'].max()
                     
                     unique_chart_key = f"resid_{scen_id}_{uuid.uuid4().hex}"
                     
-                    fig = px.line(df_resid, x="Time", y="Residual", color="Variable", log_y=True, color_discrete_map=RESIDUAL_COLOR_MAP, markers=True)
+                    # Disabled markers for massive performance gain when rendering full log histories
+                    fig = px.line(df_resid, x="Time", y="Residual", color="Variable", log_y=True, color_discrete_map=RESIDUAL_COLOR_MAP, markers=False)
+                    fig.update_xaxes(range=[0, max(10, current_time * 1.05)]) # Rigidly lock X-axis to 0
                     chart_placeholder.plotly_chart(fig, key=unique_chart_key)
                 else:
                     chart_placeholder.info(f"⏳ Accumulating residual data for {case_name}...")
@@ -844,7 +912,7 @@ with tab2:
                         with open(meta_path, "r") as mf:
                             leak_meta = json.load(mf)
                         if leak_meta:
-                            rem_inv_kg = 0.0
+                            is_blowdown = True # Inform auto-stop that this has an inventory limit
                             for lk in leak_meta:
                                 m0 = lk.get("M0", 0)
                                 tau = lk.get("tau", 1)
@@ -861,19 +929,49 @@ with tab2:
                     disp_df = outlet_df.copy().reset_index(drop=True)
                     disp_df.index = disp_df.index + 1
                     disp_df["Concentration (ppm)"] = disp_df["Concentration (ppm)"].map(lambda x: "{:.3e}".format(x))
-                    disp_df["Flow Rate"] = disp_df["Mass Flow (kg/s)"].map(lambda x: "{:.3e}".format(x))
+                    
+                    # Dynamic Flow Rate Column
+                    if flow_unit == "Mass (kg/s)":
+                        disp_df["Flow Rate"] = disp_df["Mass Flow (kg/s)"].map(lambda x: "{:.3e}".format(x))
+                    elif flow_unit == "Molar (kmol/s)":
+                        disp_df["Flow Rate"] = disp_df["Molar Flow (kmol/s)"].map(lambda x: "{:.3e}".format(x))
+                    else:
+                        # Approx Volumetric (m3/s) = Mass (kg/s) / Density of Air (~1.2 kg/m3)
+                        disp_df["Flow Rate"] = (disp_df["Mass Flow (kg/s)"] / 1.2).map(lambda x: "{:.3e}".format(x))
+                        
                     outlet_table.dataframe(disp_df[["Species", "Concentration (ppm)", "Flow Rate"]], width="stretch")
                 else:
                     outlet_table.info(f"⏳ Awaiting outlet flow data for {case_name}...")
 
-                # Filter out Air so the chart auto-scales specifically to the actual gas concentrations
                 raw_timeseries = runner.get_outlet_timeseries(case_path)
                 if raw_timeseries is not None and not raw_timeseries.empty:
-                    df_out_timeseries = raw_timeseries[raw_timeseries['Species'] != 'Air']
+                    df_out_timeseries = raw_timeseries
                     
                     if not df_out_timeseries.empty and len(df_out_timeseries['Time'].unique()) > 1:
-                        fig_out = px.line(df_out_timeseries, x="Time", y="Concentration (ppm)", color="Species", title="Live Outlet Gas Concentrations", color_discrete_map=RESIDUAL_COLOR_MAP, markers=True)
-                        fig_out.update_yaxes(autorange=True) # Ensure auto-scaling works
+                        
+                        # Use make_subplots to put Air on a secondary Y-axis so trace gases dont get squashed
+                        fig_out = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig_out.update_layout(title_text="Live Outlet Gas Concentrations", legend_title_text="Species", margin=dict(t=50, l=25, r=25, b=25))
+                        
+                        for spec in df_out_timeseries["Species"].unique():
+                            spec_df = df_out_timeseries[df_out_timeseries['Species'] == spec]
+                            is_air = (spec == "Air")
+                            
+                            fig_out.add_trace(
+                                go.Scatter(
+                                    x=spec_df["Time"], 
+                                    y=spec_df["Concentration (ppm)"], 
+                                    name=spec, 
+                                    mode='lines', 
+                                    # Fallback explicitly specified to avoid implicit grey fallback 
+                                    line=dict(color=RESIDUAL_COLOR_MAP.get(spec, "#ff0000"))
+                                ),
+                                secondary_y=is_air
+                            )
+
+                        fig_out.update_yaxes(title_text="Trace Gases (ppm)", secondary_y=False, autorange=True)
+                        fig_out.update_yaxes(title_text="Air (ppm)", secondary_y=True, range=[0, 1050000], showgrid=False)
+                        fig_out.update_xaxes(range=[0, max(10, current_time * 1.05)], title_text="Time")
                         
                         alarm_log_data = []
                         
@@ -884,8 +982,8 @@ with tab2:
                                 
                                 for i, (lvl_name, lvl_key, color) in enumerate([("Low (Warning)", "low", "orange"), ("High (Danger)", "high", "red"), ("Emergency", "emergency", "darkred")]):
                                     threshold = limits[lvl_key]
-                                    # Use a fixed position since dropping Air fixes the scaling squash
-                                    fig_out.add_hline(y=threshold, line_dash="dash", annotation_text=f"{spec} {lvl_name}", annotation_position="top left", line_color=color)
+                                    # Add horizontal line to the primary y-axis
+                                    fig_out.add_hline(y=threshold, line_dash="dash", annotation_text=f"{spec} {lvl_name}", annotation_position="top left", line_color=color, secondary_y=False)
                                     
                                     exceed_df = spec_df[spec_df['Concentration (ppm)'] >= threshold]
                                     trigger_time = f"{exceed_df['Time'].min():.2f}s" if not exceed_df.empty else "Not Reached"
@@ -906,8 +1004,9 @@ with tab2:
                         outlet_chart_placeholder.plotly_chart(fig_out, key=unique_outlet_key)
                         latest_outlet_fig = fig_out
 
-                        if st.session_state.auto_stop and check_steady_state(df_out_timeseries):
-                            status_data[current_idx]["Status"] = "✅ Steady-State Reached"
+                        # Check Auto-Stop using the smart logic (Inventory vs Continuous)
+                        if st.session_state.auto_stop and check_steady_state(df_out_timeseries, rem_inv_kg, is_blowdown):
+                            status_data[current_idx]["Status"] = "✅ Full released curve captured" if is_blowdown else "✅ Steady-State Reached"
                             update_status_table(status_data)
                             
                             # GRACEFUL SHUTDOWN FIX: Modify controlDict to tell OpenFOAM to write the final 3D frame and safely exit
@@ -935,13 +1034,15 @@ with tab2:
             sim_success = False
             if os.path.exists(log_path):
                 with open(log_path, "r") as f:
-                    content = f.read()
-                    if "Final residual" in content or "End" in content or "✅ Steady-State" in status_data[current_idx]["Status"]:
+                    lines = f.readlines()
+                    tail_content = "".join(lines[-200:])
+                    if "\nEnd\n" in tail_content or "released" in status_data[current_idx]["Status"] or "Steady-State" in status_data[current_idx]["Status"]:
                         sim_success = True
 
             if sim_success and not st.session_state.error_found:
-                if "Steady-State" not in status_data[current_idx]["Status"]:
-                    status_data[current_idx]["Status"] = "✅ Success"
+                # If it stopped due to time expiration, use a simpler success message
+                if "released" not in status_data[current_idx]["Status"] and "Steady-State" not in status_data[current_idx]["Status"]:
+                    status_data[current_idx]["Status"] = "✅ Completed (Reached Max Time)"
                 update_status_table(status_data)
                 
                 try:
